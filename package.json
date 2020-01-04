@@ -1,0 +1,36 @@
+{
+  "name": "collab-object",
+  "version": "1.0.0",
+  "description": "",
+  "keywords": [],
+  "main": "src/index.js",
+  "dependencies": {
+    "@types/react": "16.9.16",
+    "@types/react-dom": "16.9.4",
+    "@types/uuid": "3.4.6",
+    "firebase": "7.6.0",
+    "jest": "24.9.0",
+    "mocha": "6.2.2",
+    "node-sass": "4.13.0",
+    "react": "16.12.0",
+    "react-dom": "16.12.0",
+    "react-firebase-hooks": "2.1.1",
+    "react-scripts": "3.0.1",
+    "slate": "0.55.0",
+    "slate-react": "0.55.0",
+    "uuid": "3.3.3"
+  },
+  "devDependencies": {
+    "typescript": "3.3.3"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test --env=jsdom",
+    "eject": "react-scripts eject"
+  },
+  "browserslist": [">0.2%", "not dead", "not ie <= 11", "not op_mini all"],
+  "alias": {
+    "~/": "./src"
+  }
+}

@@ -1,2 +1,0 @@
-# resource
-Created with CodeSandbox

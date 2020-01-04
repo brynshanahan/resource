@@ -1,0 +1,54 @@
+* {
+  box-sizing: border-box;
+}
+
+.App {
+  font-family: sans-serif;
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+
+  .Form {
+    display: flex;
+    margin-left: -20px;
+    flex-wrap: wrap;
+
+    label {
+      flex: 0 0 50%;
+      padding-right: 20px;
+      padding-left: 20px;
+
+      input {
+        width: 100%;
+        display: block;
+      }
+    }
+
+    input[type="submit"] {
+      margin-left: 20px;
+      margin-top: 8px;
+    }
+
+    input {
+      border-radius: 3px;
+      border: solid 1px white;
+      padding: 4px 8px;
+    }
+  }
+}
+
+h1, h2, h3, h4, h5, h6, p {
+  margin-top: 0;
+  margin-bottom: 0.5em;
+}
+
+header {
+  padding: 20px;
+  background: lightblue;
+}
+
+main {
+  padding: 20px;
+  background: rgb(250, 250, 250);
+  flex: 1;
+}
