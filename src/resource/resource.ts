@@ -1,77 +1,127 @@
-import firebase from 'firebase';
+import firebase from 'firebase'
 import Operations, {
   Operation,
   NoopOperation,
   SpecificOperation,
   PartialSpecificOperation,
-} from './operations';
-import Queue from './queue';
-import Transforms from './transforms';
-import AsyncOverwriteMap from './async-map';
-import produce from 'immer';
+} from './operations'
+import Queue from './queue'
+import Transforms from './transforms'
+import AsyncOverwriteMap from './async-map'
+import produce, { applyPatches } from 'immer'
+import { PathString } from './paths'
 
-type FireRef = import('firebase').database.Reference;
+type FireRef = import('firebase').database.Reference
 
 interface ProposeOperationOptions {
   apply?: boolean
   operations: PartialSpecificOperation[]
 }
 
+type OperationHandlerCallback<T extends {}> = (arg:{
+  operation: SpecificOperation,
+  state: T
+  rebase: boolean
+}) => any
 
+class OperationHandler {
+  handler: OperationHandlerCallback<any>
+  stateStorage: {
+    [operationId:string]:any
+  }
+  constructor (
+    handler:OperationHandlerCallback<any>
+  ) {
+    this.handler = handler
+  }
+  remove (operation:SpecificOperation) {
+    delete this.stateStorage[operation.id]
+  }
+  save(operation:SpecificOperation, value:any) {
+    this.stateStorage[operation.id] = value
+  }
+  get(operation:SpecificOperation) {
+    return this.stateStorage[operation.id]
+  }
+  handle (operation:SpecificOperation, rebase: boolean) {
+    this.handler({
+      operation,
+      state: this.get(operation),
+      rebase
+    })
+  }
+}
 
 class Resource<T> {
-  client: string;
-  disconnector: () => any = () => {};
+  client: string
+  disconnector: () => any = () => {}
 
   refs: {
-    root: FireRef;
-    current: FireRef;
-    operations: FireRef;
-  };
+    root: FireRef
+    current: FireRef
+    operations: FireRef
+  }
 
   value: {
-    client: T;
-    source: T;
-  };
+    client: T
+    source: T
+  }
 
   operations: {
-    distinct: {};
+    distinct: {}
     /* recieved ops are operations that happened before the first pendingClient operation */
-    pending: Queue<SpecificOperation>;
-    recieved: Queue<SpecificOperation>;
-    beforeNextOp: Queue<SpecificOperation>;
-    recievedChanges: AsyncOverwriteMap<string, SpecificOperation>;
-  };
+    pending: Queue<SpecificOperation>
+    recieved: Queue<SpecificOperation>
+    beforeNextOp: Queue<SpecificOperation>
+    recievedChanges: AsyncOverwriteMap<string, SpecificOperation>
+  }
+
+  custom_operation_handlers: {} = {}
+
+  registerCustomOperationHandler(path: PathString) {
+    const handler = {
+      onRecieveOperation: (fn: { operations: SpecificOperation[] }) => {},
+      sendOperations(arg: {
+        operations: any[],
+
+      }),
+      unregister: () =>  {
+        delete this.custom_operation_handlers[path]
+      }
+    }
+
+    this.custom_operation_handlers[path] = this.custom_operation_handlers
+  }
 
   constructor(identifier: string, client: string) {
     // @ts-ignore
-    this.refs = {};
-    this.refs.root = firebase.database().ref(identifier);
-    this.refs.current = this.refs.root.child('current');
-    this.refs.operations = this.refs.root.child('operations');
-    this.client = client;
+    this.refs = {}
+    this.refs.root = firebase.database().ref(identifier)
+    this.refs.current = this.refs.root.child('current')
+    this.refs.operations = this.refs.root.child('operations')
+    this.client = client
   }
 
   async connect() {
     this.refs.operations.on('child_added', childSnapshot => {
-      const operation = childSnapshot.val() as SpecificOperation;
-      this.operations.recieved.push(operation);
-    });
+      const operation = childSnapshot.val() as SpecificOperation
+      this.operations.recieved.push(operation)
+    })
     this.refs.operations.on('child_changed', childSnapshot => {
-      const operation = childSnapshot.val() as SpecificOperation;
-      this.operations.recievedChanges.set(operation.id, operation);
-    });
+      const operation = childSnapshot.val() as SpecificOperation
+      this.operations.recievedChanges.set(operation.id, operation)
+    })
   }
 
   async markAsSettled(operation?: SpecificOperation) {
     if (operation) {
       return this.refs.operations
         .child(operation.id)
-        .update({ ...operation, settled: true });
+        .update({ ...operation, settled: true })
     }
   }
 
-  createSourceValue () {
+  createSourceValue() {
     this.value.source = this.value.client
     /* 
     Need to find a way to snapshot client state with this version of state 
@@ -80,21 +130,21 @@ class Resource<T> {
   }
 
   async allSettled(operations: SpecificOperation[]) {
-    const ops = [];
+    const ops = []
     for (const key in operations) {
-      const op = operations[key];
-      let settledOp: false | SpecificOperation = false;
+      const op = operations[key]
+      let settledOp: false | SpecificOperation = false
 
       /* 
       This should only update once, but for forward compatability we will make it listen until settled
       Instead of just listening until first update
       */
       while (!Operations.isSettled(settledOp)) {
-        settledOp = await this.operations.recievedChanges.pop(op.id);
+        settledOp = await this.operations.recievedChanges.pop(op.id)
       }
-      ops.push(settledOp);
+      ops.push(settledOp)
     }
-    return ops;
+    return ops
   }
 
   updateSettledSource(settledOperations: Operation[]) {}
@@ -107,16 +157,18 @@ class Resource<T> {
     */
     for await (let remoteOp of this.operations.recieved) {
       if (!this.operations.pending.length) {
-        this.applyOperations({ operations: [remoteOp] });
+        const operations = await this.allSettled([remoteOp])
+        this.applyOperations(this.value.source, ...operations)
+        this.applyOperations(this.value.client, ...operations)
       } else {
         /* We've recieved the parked operation equal to the first pending item */
         if (Operations.areEqual(remoteOp, this.operations.pending.next())) {
           /* Remove the first item from the pending queue */
-          const op = this.operations.pending.shift();
+          const op = this.operations.pending.shift()
           /* Wait for all the remote operations to finish */
           const settledRemoteOps = await this.allSettled(
             this.operations.beforeNextOp.items
-          );
+          )
 
           /* Transform each item in the local pending queue by the settled remote ops */
           this.operations.pending.map(op =>
@@ -125,17 +177,17 @@ class Resource<T> {
                 Transforms.transform(operation, remoteOperation),
               op
             )
-          );
+          )
 
           /* Push the update to the server */
-          const settledOp = await this.markAsSettled(op);
+          const settledOp = await this.markAsSettled(op)
 
-          this.updateSettledSource([...settledRemoteOps, settledOp]);
+          this.updateSettledSource([...settledRemoteOps, settledOp])
         } else {
           /* Apply all the operations to the local operations */
           this.operations.beforeNextOp.push(
             this.operations.recieved.shift() as SpecificOperation
-          );
+          )
         }
       }
     }
@@ -144,17 +196,19 @@ class Resource<T> {
   async disconnect() {}
 
   /* Update state. This function will not trigger server updates */
-  applyOperations(source = this.value.client, ...ops: SpecificOperation[]) {
+  applyOperations(source: T, ...ops: SpecificOperation[]) {
+    let value = source
     for (const operation of ops) {
       /* No operation operation 😎 */
       if (Operations.isNoopOperation(operation)) {
-        continue;
+        continue
       }
-      if (Operations.isReplaceOperation(operation)) {
-      }
-      if (Operations.isAddOperation(operation)) {
-      }
-      if (Operations.isRemoveOperation(operation)) {
+
+      /* Adding replacing and removing is handled by immer */
+      if (Operations.isImmerCompat(operation)) {
+        const immerPatch = Operations.toImmerPatch(operation)
+        if (!immerPatch) continue
+        value = applyPatches(value, [immerPatch])
       }
       if (Operations.isCustomOperation(operation)) {
       }
@@ -173,32 +227,31 @@ class Resource<T> {
     Locally we update the value immediately, but we dont send the full value to the server. Just the patches
     */
     this.value.client = produce(this.value.client, updater, patches => {
-      const operations = patches.map(Operations.fromImmerPatch);
+      const operations = patches.map(Operations.fromImmerPatch)
       /* We don't want to reapply the operations to state because immer did it for us */
-      this.proposeOperations({ operations, apply: false });
-    });
+      this.proposeOperations({ operations, apply: false })
+    })
   }
 
   /* This is the function you call from the client */
-  async proposeOperations(opts:ProposeOperationOptions) {
+  async proposeOperations(opts: ProposeOperationOptions) {
     if (!this.value.source) {
       this.createSourceValue()
     }
 
     const { apply, operations } = opts
 
-    
     /* Compress operations now */
     for (const op of operations) {
       /* The operation needs to get some ownership and metadata added to it */
       const ref = this.refs.operations.push()
-      
-      const operation:SpecificOperation = {
+
+      const operation: SpecificOperation = {
         ...op,
         client: 'test_client',
         id: ref.key as string,
         /* Initially just the id is pushed to the server */
-        settled: true
+        settled: true,
       }
 
       /* We need to apply this operation to the local state before we park it */
@@ -209,7 +262,7 @@ class Resource<T> {
       /* Add the operation to the local pending queue */
       this.operations.pending.push(operation)
       /* 
-      Send the request to the server
+      Send the parking request to the server
       the full value will be added in the runUpdates function
       */
       const parkedPromise = ref.set({ id: operation.id })
@@ -217,4 +270,4 @@ class Resource<T> {
   }
 }
 
-export default Resource;
+export default Resource
