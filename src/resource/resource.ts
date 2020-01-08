@@ -4,57 +4,116 @@ import Operations, {
   NoopOperation,
   SpecificOperation,
   PartialSpecificOperation,
+  CustomOperation,
+  RawOperation,
+  RawCustomOperation,
 } from './operations'
 import Queue from './queue'
 import Transforms from './transforms'
 import AsyncOverwriteMap from './async-map'
 import produce, { applyPatches } from 'immer'
 import { PathString } from './paths'
+import Value from './value'
+import Subject from '../subject'
+import uuid from 'uuid'
 
 type FireRef = import('firebase').database.Reference
+type DataSnapshot = import('firebase').database.DataSnapshot
+
+export function msg(strings: any, ...values: any): string {
+  // Interweave the strings with the
+  // substitution vars first.
+  let output = ''
+  for (let i = 0; i < values.length; i++) {
+    output += strings[i] + values[i]
+  }
+  output += strings[values.length]
+
+  // Split on newlines.
+  let lines = output.split(/(?:\r\n|\n|\r)/)
+
+  // Rip out the leading whitespace.
+  return lines
+    .map(line => {
+      return line.replace(/^\s+/gm, '')
+    })
+    .join(' ')
+    .trim()
+}
+
+/* Client is the same across the whole computer */
+const CLIENT: string =
+  localStorage['resource__clientID'] ||
+  (localStorage['resouce__clientID'] = uuid())
+
+interface CustomerOperatorOpts<V> {
+  path: PathString
+  version: string
+
+  /* 
+  A function that describes state at the current snapshot, not required to be serializable
+  */
+  snapshot: () => {
+    [key: string]: any
+  }
+
+  /* 
+  A function that gets called when a new operation comes in
+  */
+  onOperation: <T>(operation: CustomOperation<T>) => any
+
+  /* 
+  A function that get's called when another client edits the same custom operator before the current operation getes sent
+  */
+  transformer: <T>(
+    operation: CustomOperation<T>,
+    beforeOperation: CustomOperation<any>
+  ) => CustomOperation<any>
+
+  /* Add a function for backwards and forwards compatability */
+  mapVersion: (arg: { value: V; version: string }) => V
+}
 
 interface ProposeOperationOptions {
   apply?: boolean
   operations: PartialSpecificOperation[]
 }
 
-type OperationHandlerCallback<T extends {}> = (arg:{
-  operation: SpecificOperation,
-  state: T
-  rebase: boolean
-}) => any
-
-class OperationHandler {
-  handler: OperationHandlerCallback<any>
-  stateStorage: {
-    [operationId:string]:any
-  }
-  constructor (
-    handler:OperationHandlerCallback<any>
-  ) {
-    this.handler = handler
-  }
-  remove (operation:SpecificOperation) {
-    delete this.stateStorage[operation.id]
-  }
-  save(operation:SpecificOperation, value:any) {
-    this.stateStorage[operation.id] = value
-  }
-  get(operation:SpecificOperation) {
-    return this.stateStorage[operation.id]
-  }
-  handle (operation:SpecificOperation, rebase: boolean) {
-    this.handler({
-      operation,
-      state: this.get(operation),
-      rebase
-    })
-  }
+const ResourceCache = {
+  get<T = any>(key: string): Resource<T> {
+    return this[key]
+  },
+  set<T = any>(key: string, resource: Resource<T>) {
+    this[key] = resource
+  },
+  delete(key: string) {
+    delete this[key]
+  },
+  has(key: string) {
+    return !!this.get(key)
+  },
 }
 
-class Resource<T> {
+class Resource<T> extends Subject<'change_client' | 'change_server'> {
   client: string
-  disconnector: () => any = () => {}
+  user: string
+  identifier: string
+
+  /* Only used in testing */
+  latency: number
+
+  disconnector?: () => any
+
+  /* 
+  Multiple users can listen to this object
+  */
+  key = 0
+  getKey() {
+    return `k${this.key++}`
+  }
+  connections: string[] = []
+
+  events = new Subject<'op_added' | 'op_changed' | 'op_removed' | 'op_moved'>()
 
   refs: {
     root: FireRef
@@ -68,49 +127,104 @@ class Resource<T> {
   }
 
   operations: {
-    distinct: {}
     /* recieved ops are operations that happened before the first pendingClient operation */
     pending: Queue<SpecificOperation>
     recieved: Queue<SpecificOperation>
     beforeNextOp: Queue<SpecificOperation>
     recievedChanges: AsyncOverwriteMap<string, SpecificOperation>
+  } = {
+    pending: new Queue(),
+    recieved: new Queue(),
+    beforeNextOp: new Queue(),
+    recievedChanges: new AsyncOverwriteMap(),
   }
 
-  custom_operation_handlers: {} = {}
+  operators: {
+    [key: string]: CustomerOperatorOpts<any>
+  }
 
-  registerCustomOperationHandler(path: PathString) {
-    const handler = {
-      onRecieveOperation: (fn: { operations: SpecificOperation[] }) => {},
-      sendOperations(arg: {
-        operations: any[],
-
-      }),
-      unregister: () =>  {
-        delete this.custom_operation_handlers[path]
-      }
+  registerCustomOperator<Value, CustomOperationType>(
+    customOperator: CustomerOperatorOpts<Value>
+  ) {
+    const path = customOperator.path
+    if (this.operators[path] !== customOperator) {
+      /* Consider yourself registered */
+      this.operators[path] = customOperator
     }
 
-    this.custom_operation_handlers[path] = this.custom_operation_handlers
+    const api = {
+      propose: (customOperation: CustomOperationType, state: any) => {
+        const operation: RawCustomOperation<CustomOperationType> = {
+          type: 'custom',
+          operation: customOperation,
+          path,
+        }
+
+        if (state) {
+          /* Assuming the customOperations will result in the state sent */
+          this.update(draft => {
+            Value.set(draft, path, state)
+          }, false)
+        }
+
+        /* Feels so sad wrapping in an array just to make the api happy */
+        this.proposeOperations({ operations: [operation], apply: !state })
+      },
+    }
+
+    return api
   }
 
-  constructor(identifier: string, client: string) {
+  constructor(identifier: string, user: string, client: string = CLIENT) {
+    super()
+    if (ResourceCache.has(identifier)) {
+      return ResourceCache.get(identifier)
+    }
     // @ts-ignore
     this.refs = {}
     this.refs.root = firebase.database().ref(identifier)
     this.refs.current = this.refs.root.child('current')
     this.refs.operations = this.refs.root.child('operations')
-    this.client = client
+    this.user = user
+    this.identifier = identifier
+
+    ResourceCache.set(identifier, this)
   }
 
   async connect() {
-    this.refs.operations.on('child_added', childSnapshot => {
-      const operation = childSnapshot.val() as SpecificOperation
-      this.operations.recieved.push(operation)
-    })
-    this.refs.operations.on('child_changed', childSnapshot => {
-      const operation = childSnapshot.val() as SpecificOperation
-      this.operations.recievedChanges.set(operation.id, operation)
-    })
+    const connectionID = this.getKey()
+
+    if (!this.connections.length) {
+      /* Set up the listener */
+      const onOpAdded = this.events.on('op_added', op =>
+        this.operations.recieved.push(op)
+      )
+      const onOpChanged = this.events.on('op_changed', op =>
+        this.operations.recievedChanges.set(op.id, op)
+      )
+
+      this.refs.operations.on('child_added', (childSnapshot: DataSnapshot) => {
+        const operation = childSnapshot.val() as SpecificOperation
+        this.events.emit('op_added', operation)
+      })
+
+      this.refs.operations.on(
+        'child_changed',
+        (childSnapshot: DataSnapshot) => {
+          const operation = childSnapshot.val() as SpecificOperation
+          this.operations.recievedChanges.set(operation.id, operation)
+        }
+      )
+
+      this.disconnector = () => {
+        onOpAdded()
+        onOpChanged()
+      }
+    }
+
+    this.connections.push(connectionID)
+
+    return () => this.disconnect(connectionID)
   }
 
   async markAsSettled(operation?: SpecificOperation) {
@@ -193,7 +307,28 @@ class Resource<T> {
     }
   }
 
-  async disconnect() {}
+  async disconnect(connectionID?: string, hideWarning: boolean = false) {
+    if (!connectionID && this.connections.length > 1) {
+      if (!hideWarning) {
+        console.warn(msg`
+          Warning: you are trying to disconnect from a resource while there are still others listening to it.
+          If you meant to unsubscribe for a single component call the function returned from the "resouce.connect()" call.
+          If you really meant to disconnect the resource call the resource disconnect method like so "resource.disconnect(undefined, true)"
+        `)
+      } else {
+      }
+    }
+    if (connectionID) {
+      const index = this.connections.indexOf(connectionID)
+      if (index !== -1) {
+        this.connections.splice(index)[0]
+      }
+    }
+
+    if (!this.connections.length) {
+      /* Disconnect all the listeners */
+    }
+  }
 
   /* Update state. This function will not trigger server updates */
   applyOperations(source: T, ...ops: SpecificOperation[]) {
@@ -217,20 +352,24 @@ class Resource<T> {
 
   /* 
   There are two client facing ways to change the value of a resource.
-    a) by using the update function and mutating the value in the callback (which will send operatoins)
-    b) by using the proposeOperation function 
+    a) by using the update function and mutating the value in the callback (which will create operations and replace the value)
+    b) by using the proposeOperation function
   */
 
   /* Client facing api to create a new value */
-  update(updater: (value: T) => any) {
+  update(updater: (value: T) => any, apply = true) {
     /* 
     Locally we update the value immediately, but we dont send the full value to the server. Just the patches
     */
     this.value.client = produce(this.value.client, updater, patches => {
-      const operations = patches.map(Operations.fromImmerPatch)
-      /* We don't want to reapply the operations to state because immer did it for us */
-      this.proposeOperations({ operations, apply: false })
+      if (apply) {
+        const operations = patches.map(Operations.fromImmerPatch)
+        /* We don't want to reapply the operations to state because immer did it for us */
+        this.proposeOperations({ operations, apply: false })
+      }
     })
+
+    this.emit('change_client', this.value.client)
   }
 
   /* This is the function you call from the client */
@@ -239,7 +378,7 @@ class Resource<T> {
       this.createSourceValue()
     }
 
-    const { apply, operations } = opts
+    const { apply = true, operations } = opts
 
     /* Compress operations now */
     for (const op of operations) {
@@ -248,8 +387,9 @@ class Resource<T> {
 
       const operation: SpecificOperation = {
         ...op,
-        client: 'test_client',
-        id: ref.key as string,
+        client: this.client,
+        user: this.user,
+        uid: ref.key as string,
         /* Initially just the id is pushed to the server */
         settled: true,
       }
@@ -257,6 +397,7 @@ class Resource<T> {
       /* We need to apply this operation to the local state before we park it */
       if (apply) {
         this.applyOperations(this.value.client, op)
+        this.emit('change_client', this.value.client)
       }
 
       /* Add the operation to the local pending queue */

@@ -6,6 +6,9 @@ Operations extend Immer's operations
 
 export interface RawOperation {
   type: 'replace' | 'add' | 'remove' | 'custom' | 'noop'
+  id?: string
+  client?: string
+  settled?: boolean
 }
 
 export interface Operation extends RawOperation {
@@ -41,15 +44,40 @@ export interface RemoveOperation extends Operation {
   type: 'remove'
   path: PathString
 }
+/* Raw variants */
+export interface RawReplaceOperation<V = any> extends RawOperation {
+  type: 'replace'
+  path: PathString
+  value: V
+}
+export interface RawAddOperation<V = any> extends RawOperation {
+  type: 'add'
+  path: PathString
+  value: V
+}
+export interface RawRemoveOperation extends RawOperation {
+  type: 'remove'
+  path: PathString
+}
 
 /* Operations can be turned to Noop operations if a remote deletes a parent before the client operation settles */
 export interface NoopOperation extends Operation {
+  type: 'noop'
+}
+/* Raw variant */
+export interface RawNoopOperation extends RawOperation {
   type: 'noop'
 }
 
 /* The custom operations that can be piped into elements that accept them */
 export interface CustomOperation<T> extends Operation {
   type: 'custom'
+  path: PathString
+  operation: T
+}
+export interface RawCustomOperation<T> extends RawOperation {
+  type: 'custom'
+  path: PathString
   operation: T
 }
 
@@ -58,10 +86,11 @@ export type SpecificOperation =
   | ReplaceOperation
   | RemoveOperation
   | NoopOperation
-export type PartialSpecificOperation = SpecificOperation & {
-  id?: string
-  client?: string
-}
+export type RawSpecificOperation =
+  | RawAddOperation
+  | RawReplaceOperation
+  | RawRemoveOperation
+  | RawNoopOperation
 
 const Operations = {
   isCustomOperation<T>(operation: Operation): operation is CustomOperation<T> {
